@@ -1,0 +1,472 @@
+#include "AppController.h"
+#include "../audio/AudioProcessor.h"
+
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QDateTime>
+#include <QStandardPaths>
+
+AppController::AppController(QObject *parent)
+    : QObject(parent)
+    , m_api(new KutPodClient(this))
+    , m_audioProc(new AudioProcessor(this))
+    , m_recorder(new AudioRecorder(this))
+    , m_draftStore(new DraftStore(this))
+    , m_templateStore(new TemplateStore(this))
+    , m_podcastStore(new PodcastStore(this))
+    , m_settings("kutfast", "kutfast")
+    , m_lufsTarget(m_settings.value("lufsTarget", -16).toInt())
+{
+    // ── API signals ─────────────────────────────────────────
+    connect(m_api, &KutPodClient::podcastFetched, this,
+            [this](const Podcast &p) {
+        m_podcastInfo.clear();
+        m_podcastInfo["id"]          = p.id;
+        m_podcastInfo["handle"]      = p.handle;
+        m_podcastInfo["title"]       = p.title;
+        m_podcastInfo["description"] = p.description;
+        m_podcastInfo["coverUrl"]    = p.coverUrl;
+        emit podcastInfoChanged();
+    });
+
+    connect(m_api, &KutPodClient::episodesFetched, this,
+            [this](int /*podcastId*/, const QList<Episode> &episodes) {
+        m_episodes.clear();
+        m_drafts.clear();
+        int maxNum = 0;
+        for (const Episode &e : episodes) {
+            if (e.isDraft) m_drafts  << e.toVariantMap();
+            else           m_episodes << e.toVariantMap();
+            if (e.episodeNumber > maxNum) maxNum = e.episodeNumber;
+        }
+        m_nextEpisodeNumber = maxNum + 1;
+        emit episodesChanged();
+        setBusy(false);
+    });
+
+    connect(m_api, &KutPodClient::episodePublished, this,
+            [this](const Episode &e) {
+        setBusy(false);
+        setStatus(QString("✓ Episodio '%1' publicado correctamente.").arg(e.title));
+        emit episodePublishedOk(e.title);
+        refreshEpisodes();
+    });
+
+    connect(m_api, &KutPodClient::draftPublished, this,
+            [this](int episodeId) {
+        setBusy(false);
+        setStatus(QString("✓ Borrador #%1 publicado correctamente.").arg(episodeId));
+        refreshEpisodes();
+    });
+
+    connect(m_api, &KutPodClient::errorOccurred, this,
+            [this](const QString &msg) {
+        setBusy(false);
+        setStatus(msg, /*isError=*/true);
+    });
+
+    connect(m_api, &KutPodClient::uploadProgress, this,
+            [this](qint64 sent, qint64 total) {
+        if (total > 0) {
+            m_uploadProgress = static_cast<int>(sent * 100 / total);
+            emit uploadProgressChanged(m_uploadProgress);
+        }
+    });
+
+    // ── AudioProcessor signals ───────────────────────────────
+    connect(m_audioProc, &AudioProcessor::progressChanged, this,
+            [this](int p) {
+        m_conversionProgress = p;
+        emit conversionProgressChanged(p);
+    });
+
+    connect(m_audioProc, &AudioProcessor::errorOccurred, this,
+            [this](const QString &msg) {
+        setBusy(false);
+        setStatus(msg, true);
+    });
+
+    // finished conectado dinámicamente en publishEpisode (lleva closure con fields)
+
+    // Set initial LUFS target in AudioProcessor
+    m_audioProc->setLufsTarget(m_lufsTarget);
+    
+    // ── Aplicar config guardada ──────────────────────────────
+    if (isConfigured()) {
+        applyApiConfig();
+        m_activePodcast = m_settings.value("defaultHandle").toString();
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  LUFS target
+// ──────────────────────────────────────────────────────────────
+
+void AppController::setLufsTarget(int target)
+{
+    if (m_lufsTarget == target) return;
+    
+    m_lufsTarget = target;
+    m_settings.setValue("lufsTarget", target);
+    m_audioProc->setLufsTarget(target);
+    emit lufsTargetChanged();
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Configuración
+// ──────────────────────────────────────────────────────────────
+
+bool AppController::isConfigured() const
+{
+    return !m_settings.value("instanceUrl").toString().isEmpty()
+        && !m_settings.value("apiUser").toString().isEmpty();
+}
+
+void AppController::saveSettings(const QString &instanceUrl,
+                                  const QString &apiUser,
+                                  const QString &apiPassword,
+                                  const QString &defaultHandle,
+                                  int            userId)
+{
+    m_settings.setValue("instanceUrl",    instanceUrl);
+    m_settings.setValue("apiUser",        apiUser);
+    m_settings.setValue("apiPassword",    apiPassword);
+    m_settings.setValue("defaultHandle",  defaultHandle);
+    m_settings.setValue("userId",         userId);
+    m_settings.setValue("lufsTarget",     m_lufsTarget); // Save LUFS target
+    applyApiConfig();
+    if (m_activePodcast.isEmpty()) setActivePodcast(defaultHandle);
+    emit configuredChanged();
+    setStatus("Configuración guardada.");
+}
+
+QVariantMap AppController::loadSettings() const
+{
+    return {
+        {"instanceUrl",   m_settings.value("instanceUrl").toString()},
+        {"apiUser",       m_settings.value("apiUser").toString()},
+        {"apiPassword",   m_settings.value("apiPassword").toString()},
+        {"defaultHandle", m_settings.value("defaultHandle").toString()},
+        {"userId",        m_settings.value("userId", 1).toInt()},
+        {"lufsTarget",    m_settings.value("lufsTarget", -16).toInt()}, // Include LUFS target
+    };
+}
+
+void AppController::applyApiConfig()
+{
+    m_api->configure(
+        m_settings.value("instanceUrl").toString(),
+        m_settings.value("apiUser").toString(),
+        m_settings.value("apiPassword").toString()
+    );
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Podcasts
+// ──────────────────────────────────────────────────────────────
+
+QVariantList AppController::podcasts() const
+{
+    return m_podcastStore->all();
+}
+
+void AppController::setActivePodcast(const QString &handle)
+{
+    if (m_activePodcast == handle) return;
+    m_activePodcast = handle;
+    emit activePodcastChanged();
+    refreshEpisodes();
+}
+
+void AppController::addPodcast(const QString &name, const QString &handle)
+{
+    if (!isConfigured()) { setStatus("Configura la app primero.", true); return; }
+    setBusy(true);
+    // Verificar que el handle existe en KutPod antes de guardar localmente
+    connect(m_api, &KutPodClient::podcastIdResolved, this,
+            [this, name, handle](const QString &h, int) {
+        if (h == handle) {
+            m_podcastStore->add(name, handle);
+            emit podcastsChanged();
+            setBusy(false);
+            setStatus(QString("Podcast '%1' añadido.").arg(name));
+        }
+    }, Qt::SingleShotConnection);
+    connect(m_api, &KutPodClient::errorOccurred, this,
+            [this](const QString &msg) {
+        setBusy(false); setStatus(msg, true);
+    }, Qt::SingleShotConnection);
+
+    m_api->resolvePodcastHandle(handle);
+}
+
+void AppController::removePodcast(const QString &handle)
+{
+    m_podcastStore->remove(handle);
+    emit podcastsChanged();
+    if (m_activePodcast == handle) {
+        auto all = m_podcastStore->all();
+        setActivePodcast(all.isEmpty() ? "" : all.first().toMap()["handle"].toString());
+    }
+}
+
+void AppController::refreshEpisodes()
+{
+    if (!isConfigured() || m_activePodcast.isEmpty()) return;
+    setBusy(true);
+
+    connect(m_api, &KutPodClient::podcastIdResolved, this,
+            [this](const QString &handle, int podcastId) {
+        if (handle == m_activePodcast) {
+            m_api->fetchAllEpisodes(podcastId);
+            m_api->fetchPodcastById(podcastId);
+        }
+    }, Qt::SingleShotConnection);
+
+    m_api->resolvePodcastHandle(m_activePodcast);
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Publicación
+// ──────────────────────────────────────────────────────────────
+
+void AppController::publishEpisode(const QVariantMap &fields,
+                                    const QString &audioFilePath,
+                                    const QString &coverFilePath)
+{
+    if (!isConfigured()) { setStatus("Configura la app primero.", true); return; }
+    if (fields["title"].toString().isEmpty()) {
+        setStatus("El título es obligatorio.", true); return;
+    }
+    if (audioFilePath.isEmpty() && fields["audioUrl"].toString().isEmpty()) {
+        setStatus("Debes seleccionar un archivo de audio o proporcionar una URL.", true);
+        return;
+    }
+
+    setBusy(true);
+    m_uploadProgress    = 0;
+    m_conversionProgress = 0;
+    emit uploadProgressChanged(0);
+    emit conversionProgressChanged(0);
+
+    if (!audioFilePath.isEmpty()) {
+        // Ensure AudioProcessor has current LUFS target
+        m_audioProc->setLufsTarget(m_lufsTarget);
+        
+        // Convertir primero a MP3 con el LUFS objetivo
+        setStatus(QString("Convirtiendo audio a MP3 (target: %1 LUFS)...").arg(m_lufsTarget));
+
+        // Conectar finished una sola vez con el closure que tiene los fields
+        connect(m_audioProc, &AudioProcessor::finished, this,
+                [this, fields, coverFilePath](const QString &mp3Path) {
+            onAudioProcessed(mp3Path, fields, coverFilePath);
+        }, Qt::SingleShotConnection);
+
+        m_audioProc->process(audioFilePath);
+    } else {
+        // Audio URL — no necesita conversión
+        onAudioProcessed(QString(), fields, coverFilePath);
+    }
+}
+
+void AppController::onAudioProcessed(const QString &mp3Path,
+                                      const QVariantMap &fields,
+                                      const QString &coverPath)
+{
+    setStatus("Subiendo episodio a KutPod...");
+
+    PublishRequest req;
+    req.podcastHandle  = m_activePodcast;
+    req.userId         = m_settings.value("userId", 1).toInt();
+    req.title          = fields["title"].toString();
+
+    QString desc = fields["description"].toString().trimmed();
+    if (desc.isEmpty()) {
+        desc = QString("Episodio publicado desde KutFast el %1")
+                   .arg(QDateTime::currentDateTime().toString("dd/MM/yyyy HH:mm"));
+    }
+    req.description    = desc;
+    req.slug           = fields["slug"].toString();
+    req.episodeNumber  = fields["episodeNumber"].toInt();
+    req.seasonNumber   = fields["seasonNumber"].toInt();
+    req.type           = fields["type"].toString().isEmpty() ? "full" : fields["type"].toString();
+    req.isExplicit     = fields["isExplicit"].toBool();
+    req.publishedAt    = fields["publishedAt"].toString();
+    req.audioFilePath  = mp3Path.isEmpty() ? QString() : mp3Path;
+    req.audioUrl       = fields["audioUrl"].toString();
+    req.coverFilePath  = coverPath;
+
+    m_api->publishEpisode(req);
+}
+
+void AppController::publishKutPodDraft(int episodeId)
+{
+    if (m_activePodcast.isEmpty()) {
+        setStatus("No hay un podcast activo seleccionado.", true);
+        return;
+    }
+    setBusy(true);
+    setStatus(QString("Publicando borrador #%1 en KutPod...").arg(episodeId));
+
+    connect(m_api, &KutPodClient::podcastIdResolved, this,
+            [this, episodeId](const QString &/*handle*/, int podcastId) {
+        m_api->publishDraft(podcastId, episodeId);
+    }, Qt::SingleShotConnection);
+
+    m_api->resolvePodcastHandle(m_activePodcast);
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Borradores locales
+// ──────────────────────────────────────────────────────────────
+
+QString AppController::saveDraft(const QVariantMap &fields)
+{
+    QString id = m_draftStore->saveDraft(m_activePodcast, fields);
+    emit localDraftsChanged();
+    return id;
+}
+
+QVariantList AppController::getDrafts()
+{
+    return m_draftStore->getDrafts(m_activePodcast);
+}
+
+QVariantMap AppController::getDraft(const QString &draftId)
+{
+    return m_draftStore->getDraft(m_activePodcast, draftId);
+}
+
+void AppController::deleteDraft(const QString &draftId)
+{
+    m_draftStore->deleteDraft(m_activePodcast, draftId);
+    emit localDraftsChanged();
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Plantillas
+// ──────────────────────────────────────────────────────────────
+
+QVariantList AppController::getTemplates() { return m_templateStore->all(); }
+
+QString AppController::addTemplate(const QString &name, const QString &body)
+{
+    return m_templateStore->add(name, body);
+}
+
+void AppController::updateTemplate(const QString &id, const QString &name, const QString &body)
+{
+    m_templateStore->update(id, name, body);
+}
+
+void AppController::deleteTemplate(const QString &id)
+{
+    m_templateStore->remove(id);
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Migración desde el proyecto PHP
+// ──────────────────────────────────────────────────────────────
+
+bool AppController::importFromPhpProject(const QString &dirPath)
+{
+    bool ok = true;
+    if (QFile::exists(dirPath + "/local_drafts.json"))
+        ok &= m_draftStore->importFromFile(dirPath + "/local_drafts.json");
+    if (QFile::exists(dirPath + "/templates.json"))
+        ok &= m_templateStore->importFromFile(dirPath + "/templates.json");
+    if (QFile::exists(dirPath + "/podcasts.json"))
+        ok &= m_podcastStore->importFromFile(dirPath + "/podcasts.json");
+
+    emit podcastsChanged();
+    setStatus(ok ? "Migración completada." : "Algunos archivos no se pudieron importar.", !ok);
+    return ok;
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Misc
+// ──────────────────────────────────────────────────────────────
+
+bool AppController::ffmpegAvailable() const
+{
+    return AudioProcessor::ffmpegAvailable();
+}
+
+void AppController::clearStatus() { m_statusMsg.clear(); emit statusMessageChanged(); }
+
+int AppController::nextEpisodeForSeason(int season) const
+{
+    int maxNum = 0;
+    for (const QVariant &v : m_episodes) {
+        QVariantMap ep = v.toMap();
+        int epSeason = ep["seasonNumber"].toInt();
+        // Si season==0 ignoramos la temporada; si no, filtramos
+        if (season == 0 || epSeason == season) {
+            int num = ep["episodeNumber"].toInt();
+            if (num > maxNum) maxNum = num;
+        }
+    }
+    return maxNum + 1;
+}
+
+void AppController::setBusy(bool busy)
+{
+    if (m_busy == busy) return;
+    m_busy = busy;
+    emit busyChanged();
+}
+
+void AppController::setStatus(const QString &msg, bool isError)
+{
+    m_statusMsg     = msg;
+    m_statusIsError = isError;
+    emit statusMessageChanged();
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Tmp file management
+// ──────────────────────────────────────────────────────────────
+
+QVariantList AppController::getTmpFiles() const
+{
+    QVariantList list;
+    QString tmpDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
+                     + "/kutfast";
+    QDir dir(tmpDir);
+    if (!dir.exists()) return list;
+
+    for (const QFileInfo &fi : dir.entryInfoList(QDir::Files, QDir::Time)) {
+        QVariantMap entry;
+        entry["name"] = fi.fileName();
+        entry["size"] = QString::number(fi.size() / 1024.0 / 1024.0, 'f', 2);
+        entry["age"]  = QString::number(fi.birthTime().secsTo(QDateTime::currentDateTime()) / 60);
+        list << entry;
+    }
+    return list;
+}
+
+void AppController::deleteTmpFile(const QString &fileName)
+{
+    QString tmpDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
+                     + "/kutfast";
+    QString path = tmpDir + "/" + QFileInfo(fileName).fileName(); // sanitize
+    if (QFile::exists(path)) {
+        QFile::remove(path);
+        setStatus("Archivo temporal eliminado.");
+    }
+}
+
+void AppController::clearAllTmpFiles()
+{
+    QString tmpDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
+                     + "/kutfast";
+    QDir dir(tmpDir);
+    if (!dir.exists()) return;
+    int count = 0;
+    for (const QFileInfo &fi : dir.entryInfoList(QDir::Files)) {
+        QFile::remove(fi.absoluteFilePath());
+        ++count;
+    }
+    setStatus(QString("%1 archivos temporales eliminados.").arg(count));
+}
